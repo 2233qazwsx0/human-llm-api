@@ -10,6 +10,7 @@ Human LLM API - 人类版LLM API服务
 import asyncio
 import json
 import os
+import random
 import sqlite3
 import subprocess
 import sys
@@ -19,8 +20,8 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 DB_PATH = "human_llm.db"
@@ -58,9 +59,9 @@ RECHARGE_METHODS = {
 }
 
 MODELS = [
-    {"id": "human-v1", "object": "model", "owned_by": "me-myself-and-i"},
-    {"id": "human-caffeinated-v2", "object": "model", "owned_by": "me-after-coffee"},
-    {"id": "human-sleepy-v0.5", "object": "model", "owned_by": "me-before-coffee"},
+    {"id": "human-v1", "object": "model", "created": 1700000000, "owned_by": "me-myself-and-i"},
+    {"id": "human-caffeinated-v2", "object": "model", "created": 1700000001, "owned_by": "me-after-coffee"},
+    {"id": "human-sleepy-v0.5", "object": "model", "created": 1700000002, "owned_by": "me-before-coffee"},
 ]
 
 HUMOR_402_MESSAGES = [
@@ -73,6 +74,14 @@ HUMOR_402_MESSAGES = [
 ]
 
 app = FastAPI(title="Human LLM API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def get_db():
@@ -226,11 +235,6 @@ def send_notification(title: str, message: str, priority: int = 1):
     print(f"{'='*50}\n")
 
 
-def get_humor_402():
-    import random
-    return random.choice(HUMOR_402_MESSAGES)
-
-
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -270,6 +274,64 @@ class ReplyRequest(BaseModel):
 pending_replies = {}
 
 
+def make_sse_chunk(msg_id: str, model: str, delta: dict, finish_reason: Optional[str] = None):
+    chunk = {
+        "id": msg_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
+async def stream_response(msg_id: str, model: str, friend: dict, content: str, priority: int, listening_cost: int):
+    yield make_sse_chunk(msg_id, model, {"role": "assistant", "content": ""})
+
+    ack_text = f"📨 消息已送达！人类（{friend['name']}的好友）正在等待回复...\n\n"
+    for char in ack_text:
+        yield make_sse_chunk(msg_id, model, {"content": char})
+        await asyncio.sleep(0.02)
+
+    reply_event = asyncio.Event()
+    pending_replies[msg_id] = {"event": reply_event, "reply": None}
+
+    got_reply = False
+    try:
+        await asyncio.wait_for(reply_event.wait(), timeout=120.0)
+        reply_content = pending_replies[msg_id]["reply"]
+        status = "replied"
+        got_reply = True
+    except asyncio.TimeoutError:
+        reply_content = "⏰ 人类暂时没有回复（可能在忙/摸鱼/喝咖啡），请稍后再来～"
+        status = "timeout"
+    finally:
+        pending_replies.pop(msg_id, None)
+
+    conn = get_db()
+    c = conn.cursor()
+    replied_at = datetime.now().isoformat() if got_reply else None
+    c.execute(
+        "UPDATE messages SET status = ?, reply = ?, replied_at = ? WHERE id = ?",
+        (status, reply_content, replied_at, msg_id),
+    )
+    conn.commit()
+    conn.close()
+
+    for char in reply_content:
+        yield make_sse_chunk(msg_id, model, {"content": char})
+        await asyncio.sleep(0.03)
+
+    yield make_sse_chunk(msg_id, model, {}, finish_reason="stop")
+    yield "data: [DONE]\n\n"
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     auth_header = request.headers.get("Authorization", "")
@@ -277,22 +339,22 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     if auth_header.startswith("Bearer "):
         api_key = auth_header[7:]
     if not api_key:
-        raise HTTPException(status_code=401, detail="缺少API Key，请在Authorization头中传入Bearer token")
+        raise HTTPException(status_code=401, detail={"message": "缺少API Key，请在Authorization头中传入Bearer token", "type": "invalid_request_error", "code": "invalid_api_key"})
     friend = authenticate(api_key)
     if not friend:
-        raise HTTPException(status_code=401, detail="无效的API Key！你确定你是我的朋友吗？🤔")
+        raise HTTPException(status_code=401, detail={"message": "无效的API Key！你确定你是我的朋友吗？🤔", "type": "invalid_request_error", "code": "invalid_api_key"})
     friend = check_monthly(friend)
     last_msg = req.messages[-1] if req.messages else None
     if not last_msg:
-        raise HTTPException(status_code=400, detail="消息不能为空！你总得说点什么吧？")
+        raise HTTPException(status_code=400, detail={"message": "消息不能为空！你总得说点什么吧？", "type": "invalid_request_error"})
     content = last_msg.content
     priority = req.priority
     listening_cost = 1
     if priority >= 8:
         listening_cost += 5
     if not deduct_tokens(friend, listening=listening_cost):
-        raise HTTPException(status_code=402, detail=get_humor_402())
-    msg_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        raise HTTPException(status_code=402, detail={"message": random.choice(HUMOR_402_MESSAGES), "type": "insufficient_quota", "code": "insufficient_quota"})
+    msg_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
     now = datetime.now().isoformat()
     conn = get_db()
     c = conn.cursor()
@@ -302,16 +364,24 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     )
     conn.commit()
     conn.close()
-    model_display = req.model
-    if model_display == "human-caffeinated-v2":
-        model_display += " ☕⚡"
-    elif model_display == "human-sleepy-v0.5":
-        model_display += " 😴💤"
+    model_name = req.model
     send_notification(
         f"来自 {friend['name']} 的消息",
         content,
         priority,
     )
+
+    if req.stream:
+        return StreamingResponse(
+            stream_response(msg_id, model_name, friend, content, priority, listening_cost),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     reply_event = asyncio.Event()
     pending_replies[msg_id] = {"event": reply_event, "reply": None}
     try:
@@ -319,7 +389,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         reply_content = pending_replies[msg_id]["reply"]
         status = "replied"
     except asyncio.TimeoutError:
-        reply_content = f"[人类正在思考中...] 消息已收到，但人类暂时没有回复。请稍后再来查看回复～"
+        reply_content = "⏰ 人类暂时没有回复（可能在忙/摸鱼/喝咖啡），请稍后再来～"
         status = "timeout"
     finally:
         pending_replies.pop(msg_id, None)
@@ -336,7 +406,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         "id": msg_id,
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": model_display,
+        "model": model_name,
         "choices": [
             {
                 "index": 0,
@@ -348,7 +418,6 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             "prompt_tokens": len(content),
             "completion_tokens": len(reply_content),
             "total_tokens": len(content) + len(reply_content),
-            "listening_tokens_charged": listening_cost,
         },
     }
     return response
